@@ -346,6 +346,12 @@ interface TrackDao {
      * documented fallback and puts files where they are not expected. A
      * display name and a storage location are different questions, so this
      * FILTERS where the viewer only sorts.
+     *
+     * A track in several enabled playlists is filed under the LOWEST
+     * playlist id, i.e. the one it was added to first. Ids never change,
+     * so the answer is stable: do NOT "fix" this to alphabetical name
+     * order — that would reshuffle files on disk every time a playlist is
+     * renamed.
      */
     @Query("""
         SELECT p.name FROM playlists p
