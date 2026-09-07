@@ -56,6 +56,11 @@ sealed interface ReorganizeLibraryState {
  *    file is deleted only AFTER the DB write succeeded. A crash between
  *    steps at worst leaves a duplicate file, never a dangling pointer.
  *  - Each track is an atomic unit; cancellation stops at track boundaries.
+ *  - Two rows that resolve to ONE target name never race for it: the
+ *    first claimant keeps the name and the rest are skipped, decided in
+ *    the plan so no delete runs for a loser.
+ *  - A reorganize refuses to start while [MoveLibraryCoordinator] is
+ *    running — both rewrite every `file_path` and would orphan files.
  *  - Concurrent invocations are collapsed (a second [start] while running
  *    is a no-op).
  */
@@ -65,6 +70,7 @@ class ReorganizeLibraryCoordinator @Inject constructor(
     private val trackDao: TrackDao,
     private val storagePreference: StoragePreference,
     private val fileOrganizer: FileOrganizer,
+    private val moveLibraryCoordinator: MoveLibraryCoordinator,
 ) {
     private val _state = MutableStateFlow<ReorganizeLibraryState>(ReorganizeLibraryState.Idle)
     val state: StateFlow<ReorganizeLibraryState> = _state.asStateFlow()
@@ -75,6 +81,15 @@ class ReorganizeLibraryCoordinator @Inject constructor(
     /** Kick off the reorganize. No-op if already running. */
     fun start() {
         if (_state.value is ReorganizeLibraryState.Running) return
+        // Both passes rewrite `file_path` for every downloaded track; run
+        // together, whichever healFilePath lands last wins and the other
+        // pass's file is orphaned. Second one to start yields.
+        if (moveLibraryCoordinator.state.value is MoveLibraryState.Running) {
+            _state.value = ReorganizeLibraryState.Error(
+                "The library is still being moved. Try again once that finishes.",
+            )
+            return
+        }
         activeJob = scope.launch { runPass() }
     }
 
@@ -101,7 +116,7 @@ class ReorganizeLibraryCoordinator @Inject constructor(
      */
     suspend fun countMisplacedTracks(): Int {
         val plan = buildPlan() ?: return 0
-        return plan.count { !it.alreadyInPlace }
+        return plan.count { !it.alreadyInPlace && !it.losesNameClash }
     }
 
     private suspend fun buildPlan(): List<PlanEntry>? {
@@ -120,7 +135,7 @@ class ReorganizeLibraryCoordinator @Inject constructor(
         }
         val musicRoot = fileOrganizer.internalMusicRoot().absolutePath.trimEnd('/')
 
-        return refs.mapNotNull { ref ->
+        val entries = refs.mapNotNull { ref ->
             val ext = ref.filePath.substringAfterLast('.', "").ifBlank { "m4a" }
             val playlistName =
                 if (layout == LibraryLayout.PLAYLIST) {
@@ -150,6 +165,25 @@ class ReorganizeLibraryCoordinator @Inject constructor(
             }
             PlanEntry(ref.id, ref.filePath, isSaf, location, targetName, alreadyInPlace)
         }
+
+        // Two rows can resolve to ONE target: SINGLE_FOLDER drops the album
+        // segment, so a studio and a live cut of the same song collide, and
+        // PLAYLIST does the same for a track filed under one playlist name.
+        // Both movers overwrite whatever occupies the target name, so an
+        // unguarded pass would delete the first claimant's audio and leave
+        // its row pointing at the second one's file. First claimant wins —
+        // a row already sitting on the name keeps it — and the rest are
+        // skipped, decided here so no delete ever runs for a loser.
+        val claimed = HashSet<String>()
+        entries.filter { it.alreadyInPlace }.forEach { claimed += it.targetKey }
+        return entries.map { entry ->
+            if (entry.alreadyInPlace || claimed.add(entry.targetKey)) {
+                entry
+            } else {
+                Log.w(TAG, "Skipping track ${entry.trackId}: '${entry.targetKey}' already claimed")
+                entry.copy(losesNameClash = true)
+            }
+        }
     }
 
     private data class PlanEntry(
@@ -159,7 +193,17 @@ class ReorganizeLibraryCoordinator @Inject constructor(
         val location: LibraryLayoutResolver.ResolvedLocation,
         val targetName: String,
         val alreadyInPlace: Boolean,
-    )
+        /** Lost the race for [targetName]; skipped so the winner's file survives. */
+        val losesNameClash: Boolean = false,
+    ) {
+        /** Case-insensitive target identity — SD cards are case-insensitive. */
+        val targetKey: String
+            get() = if (location.dirKey.isEmpty()) {
+                targetName.lowercase()
+            } else {
+                "${location.dirKey}/$targetName".lowercase()
+            }
+    }
 
     private suspend fun runPass() {
         try {
@@ -168,7 +212,7 @@ class ReorganizeLibraryCoordinator @Inject constructor(
                 _state.value = ReorganizeLibraryState.Error("Couldn't read the library database.")
                 return
             }
-            val work = plan.filterNot { it.alreadyInPlace }
+            val work = plan.filterNot { it.alreadyInPlace || it.losesNameClash }
             if (work.isEmpty()) {
                 _state.value = ReorganizeLibraryState.Done(0, plan.size, 0)
                 return
