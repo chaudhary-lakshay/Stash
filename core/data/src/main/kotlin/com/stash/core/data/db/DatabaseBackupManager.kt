@@ -524,7 +524,8 @@ class DatabaseBackupManager @Inject constructor(
      *     memberships are reactivated — the backup's content is being added,
      *     which is exactly the requested semantics. All imported memberships
      *     keep the backup's own `locally_added` answer when a sync actually
-     *     mirrors the playlist (`last_synced != null`) — forcing it to 1
+     *     mirrors the playlist (`last_synced != null` on EITHER the live or
+     *     the backup row) — forcing it to 1
      *     cleanup that exists to drop what a remote no longer has. Where no
      *     sync has ever run, a 0 is a state no live write path can produce,
      *     so it is read as user-added instead; reactivation ORs with the
@@ -643,11 +644,11 @@ class DatabaseBackupManager @Inject constructor(
                 // ONLY writer of last_synced (PlaylistDao.updateLastSynced has
                 // one call site), so non-null means this playlist's membership
                 // can legitimately be sync-owned. Null means no sync has ever
-                // touched it, and there a locally_added = 0 row is a state
-                // nothing else in the schema produces — every live add path
-                // stamps 1. Absence resolves to "user-added", which is the
-                // safe direction: a wrongly-kept membership is one the user
-                // can delete by hand, a wrongly-dropped one is gone.
+                // touched it on EITHER side, and there a locally_added = 0 row
+                // is a state nothing else in the schema produces — every live
+                // add path stamps 1. Absence resolves to "user-added", the safe
+                // direction: a wrongly-kept membership is one the user can
+                // delete by hand, a wrongly-dropped one is gone.
                 val syncMirrored = HashSet<Long>()
                 for (p in playlistDao.getAllForBackupMerge()) {
                     liveBySourceId.putIfAbsent(p.sourceId, p.id)
@@ -677,9 +678,18 @@ class DatabaseBackupManager @Inject constructor(
                         )
                     )
                     liveBySourceId.putIfAbsent(playlist.sourceId, newId)
-                    if (playlist.lastSynced != null) syncMirrored += newId
                     playlistIdMap[playlist.id] = newId
                     addedPlaylists++
+                }
+
+                // The BACKUP's history counts too: a playlist can be synced
+                // there and never yet here (sync enabled, not run), and it is
+                // that sync which wrote the backup's locally_added = 0 rows.
+                // One pass over the mapping so matched and newly-created
+                // playlists answer the question the same way.
+                for (playlist in backupPlaylists) {
+                    if (playlist.lastSynced == null) continue
+                    playlistIdMap[playlist.id]?.let { syncMirrored += it }
                 }
 
                 // ── 3. Memberships (union) ───────────────────────────────

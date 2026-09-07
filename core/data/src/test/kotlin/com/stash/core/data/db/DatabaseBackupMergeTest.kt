@@ -416,6 +416,30 @@ class DatabaseBackupMergeTest {
     }
 
     @Test
+    fun `the backup's own sync history settles ownership when the live row has none`() = runTest {
+        // Sync enabled here but never run, while the backup's copy of the
+        // same playlist HAS synced. The backup's 0 rows were written by that
+        // sync, so they are genuinely sync-owned — forcing them to 1 because
+        // the LIVE row has no last_synced yet would pin them past the next
+        // REFRESH, which is the bug this whole thread started on.
+        val pid = live.playlistDao().insert(playlist("List", "list-1", lastSynced = null))
+        val uri = buildBackupZip { backup ->
+            val t = backup.trackDao().insert(track("Remote", spotifyUri = "spotify:track:r"))
+            val bPid = backup.playlistDao().insert(
+                playlist("List", "list-1", lastSynced = Instant.now()),
+            )
+            backup.playlistDao().insertCrossRef(
+                PlaylistTrackCrossRef(bPid, t, position = 0, locallyAdded = false),
+            )
+        }
+
+        val result = manager.importDatabase(uri, BackupImportScope.LIBRARY_MERGE)
+
+        assertTrue(result.isSuccess)
+        assertFalse(flagFor(pid, "Remote"))
+    }
+
+    @Test
     fun `a playlist no sync has mirrored takes every membership as user-added`() = runTest {
         // No sync writes memberships into a playlist it does not mirror, so
         // every live add path stamps locally_added = 1 there and a 0 is a
