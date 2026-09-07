@@ -59,8 +59,9 @@ sealed interface ReorganizeLibraryState {
  *  - Two rows that resolve to ONE target name never race for it: the
  *    first claimant keeps the name and the rest are skipped, decided in
  *    the plan so no delete runs for a loser.
- *  - A reorganize refuses to start while [MoveLibraryCoordinator] is
- *    running — both rewrite every `file_path` and would orphan files.
+ *  - Only one whole-library `file_path` rewrite runs at a time: the
+ *    reorganize and the library move exclude each other through
+ *    [LibraryRewriteGate], in either start order.
  *  - Concurrent invocations are collapsed (a second [start] while running
  *    is a no-op).
  */
@@ -70,7 +71,7 @@ class ReorganizeLibraryCoordinator @Inject constructor(
     private val trackDao: TrackDao,
     private val storagePreference: StoragePreference,
     private val fileOrganizer: FileOrganizer,
-    private val moveLibraryCoordinator: MoveLibraryCoordinator,
+    private val rewriteGate: LibraryRewriteGate,
 ) {
     private val _state = MutableStateFlow<ReorganizeLibraryState>(ReorganizeLibraryState.Idle)
     val state: StateFlow<ReorganizeLibraryState> = _state.asStateFlow()
@@ -81,16 +82,22 @@ class ReorganizeLibraryCoordinator @Inject constructor(
     /** Kick off the reorganize. No-op if already running. */
     fun start() {
         if (_state.value is ReorganizeLibraryState.Running) return
-        // Both passes rewrite `file_path` for every downloaded track; run
-        // together, whichever healFilePath lands last wins and the other
-        // pass's file is orphaned. Second one to start yields.
-        if (moveLibraryCoordinator.state.value is MoveLibraryState.Running) {
+        // Only one whole-library file_path rewrite at a time — see
+        // LibraryRewriteGate. Released in the launch's finally, so a
+        // cancelled or failed pass hands it straight back.
+        if (!rewriteGate.tryAcquire(GATE_OWNER)) {
             _state.value = ReorganizeLibraryState.Error(
-                "The library is still being moved. Try again once that finishes.",
+                "${rewriteGate.heldBy} is still running. Try again once it finishes.",
             )
             return
         }
-        activeJob = scope.launch { runPass() }
+        activeJob = scope.launch {
+            try {
+                runPass()
+            } finally {
+                rewriteGate.release(GATE_OWNER)
+            }
+        }
     }
 
     /** Cancel an in-progress pass. State reverts to Idle. */
@@ -196,9 +203,14 @@ class ReorganizeLibraryCoordinator @Inject constructor(
         /** Lost the race for [targetName]; skipped so the winner's file survives. */
         val losesNameClash: Boolean = false,
     ) {
-        /** Case-insensitive target identity — SD cards are case-insensitive. */
+        /**
+         * Target identity for clash detection. Scoped to the storage root:
+         * an internal and a SAF-tree track that resolve to the same
+         * layout-relative name are written to different roots and cannot
+         * overwrite each other. Case-insensitive because SD cards are.
+         */
         val targetKey: String
-            get() = if (location.dirKey.isEmpty()) {
+            get() = (if (sourceIsSaf) "saf:" else "internal:") + if (location.dirKey.isEmpty()) {
                 targetName.lowercase()
             } else {
                 "${location.dirKey}/$targetName".lowercase()
@@ -478,6 +490,8 @@ class ReorganizeLibraryCoordinator @Inject constructor(
         /** Sidecar extension written by the lyrics module, moved alongside audio. */
         private const val LRC_EXTENSION = ".lrc"
         private const val LRC_MIME = "application/x-lrc"
+        /** Name this pass claims [LibraryRewriteGate] under. */
+        const val GATE_OWNER = "A library reorganize"
         private const val TAG = "ReorganizeCoord"
     }
 }

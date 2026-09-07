@@ -11,7 +11,6 @@ import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
@@ -37,8 +36,7 @@ class ReorganizeLibraryCoordinatorTest {
     private val trackDao = mockk<TrackDao>(relaxed = true)
     private val storagePreference = mockk<StoragePreference>()
     private val fileOrganizer = mockk<FileOrganizer>()
-    private val moveState = MutableStateFlow<MoveLibraryState>(MoveLibraryState.Idle)
-    private val moveLibrary = mockk<MoveLibraryCoordinator>()
+    private val gate = LibraryRewriteGate()
 
     private lateinit var musicRoot: File
     private lateinit var coordinator: ReorganizeLibraryCoordinator
@@ -49,9 +47,8 @@ class ReorganizeLibraryCoordinatorTest {
         every { storagePreference.externalTreeUri } returns flowOf(null)
         every { fileOrganizer.internalMusicRoot() } returns musicRoot
         coEvery { fileOrganizer.currentLayout() } returns LibraryLayout.SINGLE_FOLDER
-        every { moveLibrary.state } returns moveState
         coordinator =
-            ReorganizeLibraryCoordinator(context, trackDao, storagePreference, fileOrganizer, moveLibrary)
+            ReorganizeLibraryCoordinator(context, trackDao, storagePreference, fileOrganizer, gate)
     }
 
     private fun seed(relativePath: String, content: String): File =
@@ -182,16 +179,37 @@ class ReorganizeLibraryCoordinatorTest {
     }
 
     /**
-     * Both passes rewrite `file_path` for every downloaded track. Run at the
-     * same time, whichever [TrackDao.healFilePath] lands last wins and the
-     * other pass's file is orphaned, so the second one to start refuses.
+     * A name clash can only destroy a file when both rows land in the SAME
+     * storage root. An internal track and a SAF-tree track that resolve to
+     * one layout-relative name are written to different roots and cannot
+     * overwrite each other, so neither may be skipped.
      */
-    @Test fun `refuses to start while the library move is running`() = runBlocking {
+    @Test fun `an internal and an external row may share one target name`() = runBlocking {
+        val studio = seed("nirvana/nevermind/something-in-the-way.m4a", "STUDIO")
+        coEvery { trackDao.getDownloadedTrackRefs() } returns listOf(
+            ref(1L, studio, "Nirvana", "Nevermind", "Something In The Way"),
+            TrackExistenceRef(
+                2L, "Nirvana", "Unplugged", "Something In The Way",
+                "content://com.android.externalstorage.documents/document/1A2B%3AMusic%2Fold.m4a",
+            ),
+        )
+
+        assertThat(coordinator.countMisplacedTracks()).isEqualTo(2)
+    }
+
+    /**
+     * Both bulk passes rewrite `file_path` for every downloaded track. Run at
+     * once, whichever [TrackDao.healFilePath] lands last wins and the other
+     * pass's file is orphaned, so the second to start is refused — in EITHER
+     * order, which is why the exclusion lives in a shared gate rather than in
+     * one coordinator looking at the other.
+     */
+    @Test fun `refuses to start while another pass holds the gate`() = runBlocking {
         val file = seed("a/x/one.m4a", "ONE")
         coEvery { trackDao.getDownloadedTrackRefs() } returns listOf(
             ref(1L, file, "Artist A", "X", "One"),
         )
-        moveState.value = MoveLibraryState.Running(current = 0, total = 3)
+        assertThat(gate.tryAcquire("library move")).isTrue()
 
         coordinator.start()
         delay(300)
@@ -200,5 +218,40 @@ class ReorganizeLibraryCoordinatorTest {
         assertThat(file.readText()).isEqualTo("ONE")
         assertThat(File(musicRoot, "artist-a-one.m4a").exists()).isFalse()
         coVerify(exactly = 0) { trackDao.healFilePath(any(), any()) }
+    }
+
+    /** A finished pass hands the gate back, so the next one can run. */
+    @Test fun `the gate is released when the pass finishes`() = runBlocking {
+        val file = seed("a/x/one.m4a", "ONE")
+        coEvery { trackDao.getDownloadedTrackRefs() } returns listOf(
+            ref(1L, file, "Artist A", "X", "One"),
+        )
+
+        coordinator.start()
+        awaitDone()
+
+        assertThat(gate.heldBy).isNull()
+    }
+
+    /** Cancel hands the gate back too, or the button stays dead forever. */
+    @Test fun `the gate is released when the pass is cancelled`() = runBlocking {
+        val first = seed("a/x/one.m4a", "ONE")
+        coEvery { trackDao.getDownloadedTrackRefs() } returns listOf(
+            ref(1L, first, "Artist A", "X", "One"),
+        )
+        val reached = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        coEvery { trackDao.healFilePath(any(), any()) } coAnswers {
+            reached.countDown()
+            release.await(10, TimeUnit.SECONDS)
+        }
+
+        coordinator.start()
+        assertThat(reached.await(10, TimeUnit.SECONDS)).isTrue()
+        coordinator.cancel()
+        release.countDown()
+        delay(500)
+
+        assertThat(gate.heldBy).isNull()
     }
 }

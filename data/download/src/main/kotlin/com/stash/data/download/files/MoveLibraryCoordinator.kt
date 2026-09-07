@@ -57,6 +57,9 @@ sealed interface MoveLibraryState {
  *    the two at worst leaves a duplicate file (harmless — DB points to SAF).
  *  - Concurrent invocations are collapsed: a second [start] while [Running]
  *    is a no-op.
+ *  - Only one whole-library `file_path` rewrite runs at a time: the move
+ *    and the reorganize exclude each other through [LibraryRewriteGate],
+ *    in either start order.
  *  - Cancellation mid-move leaves the DB consistent — each track is its own
  *    atomic unit, and a cancelled coroutine stops at track boundaries.
  */
@@ -65,6 +68,7 @@ class MoveLibraryCoordinator @Inject constructor(
     @ApplicationContext private val context: Context,
     private val trackDao: TrackDao,
     private val storagePreference: StoragePreference,
+    private val rewriteGate: LibraryRewriteGate,
 ) {
     private val _state = MutableStateFlow<MoveLibraryState>(MoveLibraryState.Idle)
     val state: StateFlow<MoveLibraryState> = _state.asStateFlow()
@@ -94,7 +98,22 @@ class MoveLibraryCoordinator @Inject constructor(
      */
     fun start(targetTreeUri: Uri) {
         if (_state.value is MoveLibraryState.Running) return
-        activeJob = scope.launch { runMove(targetTreeUri) }
+        // Only one whole-library file_path rewrite at a time — see
+        // LibraryRewriteGate. Released in the launch's finally, so a
+        // cancelled or failed move hands it straight back.
+        if (!rewriteGate.tryAcquire(GATE_OWNER)) {
+            _state.value = MoveLibraryState.Error(
+                "${rewriteGate.heldBy} is still running. Try again once it finishes.",
+            )
+            return
+        }
+        activeJob = scope.launch {
+            try {
+                runMove(targetTreeUri)
+            } finally {
+                rewriteGate.release(GATE_OWNER)
+            }
+        }
     }
 
     /** Cancel an in-progress move. Flips state back to [Idle]. */
@@ -237,6 +256,8 @@ class MoveLibraryCoordinator @Inject constructor(
     }
 
     companion object {
+        /** Name this pass claims [LibraryRewriteGate] under. */
+        const val GATE_OWNER = "A library move"
         private const val TAG = "MoveLibraryCoord"
     }
 }
