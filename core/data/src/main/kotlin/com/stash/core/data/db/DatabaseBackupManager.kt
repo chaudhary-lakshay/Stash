@@ -393,6 +393,15 @@ class DatabaseBackupManager @Inject constructor(
                 }
             }
 
+            // Mirror of the check above for the settings-only scope: a
+            // library-only export carries no `datastore/` entries, and
+            // committing zero files would report a successful settings
+            // restore that wrote nothing.
+            if (scope.restoresSettingsFiles && stagedDatastore.isEmpty()) {
+                cleanupStaging(stagedDb, stagedDatastore)
+                throw IllegalStateException("The selected backup contains no settings.")
+            }
+
             // 4. Commit.
             if (scope == BackupImportScope.LIBRARY_MERGE) {
                 // Merge path: copy rows into the LIVE database. No file is
@@ -511,8 +520,17 @@ class DatabaseBackupManager @Inject constructor(
      *     unless that track is already an active member. Soft-deleted
      *     memberships are reactivated — the backup's content is being added,
      *     which is exactly the requested semantics. All imported memberships
-     *     are marked `locally_added` so REFRESH-mode syncs won't wipe them,
+     *     keep the backup's own `locally_added` answer — forcing it to 1
+     *     would make every restored membership immune to the REFRESH
+     *     cleanup that exists to drop what a remote no longer has —
      *     and cached `track_count`s of touched playlists are recomputed.
+     *
+     * **Known limit.** A backup predating the canonical-identity columns
+     * gets them from the migration chain, which adds the columns but does
+     * not run the app-side backfill, so they can arrive blank. Identity
+     * then rests on the Spotify URI / YouTube id alone, and a track with
+     * neither (a local-file import) can land as a duplicate of one the
+     * library already holds.
      *
      * Any exception anywhere rolls the entire transaction back, leaving the
      * live library byte-for-byte untouched.
@@ -596,6 +614,9 @@ class DatabaseBackupManager @Inject constructor(
                             isDownloaded = false,
                             filePath = null,
                             fileSizeBytes = 0,
+                            qualityKbps = 0,
+                            sampleRateHz = null,
+                            bitsPerSample = null,
                         )
                     )
                     track.spotifyUri?.let { liveBySpotifyUri.putIfAbsent(it, newId) }
@@ -680,13 +701,13 @@ class DatabaseBackupManager @Inject constructor(
                                 removedAt = null,
                                 position = position,
                                 addedAt = ref.addedAt,
-                                locallyAdded = true,
+                                locallyAdded = ref.locallyAdded,
                             ) ?: PlaylistTrackCrossRef(
                                 playlistId = livePlaylistId,
                                 trackId = liveTrackId,
                                 position = position,
                                 addedAt = ref.addedAt,
-                                locallyAdded = true,
+                                locallyAdded = ref.locallyAdded,
                             )
                         )
                         mergedMemberships++

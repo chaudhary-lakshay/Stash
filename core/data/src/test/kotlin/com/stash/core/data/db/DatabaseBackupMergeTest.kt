@@ -340,4 +340,78 @@ class DatabaseBackupMergeTest {
         assertNull(merged.filePath)
         assertEquals(0L, merged.fileSizeBytes)
     }
+
+    @Test
+    fun `merged tracks do not keep quality read off a file they no longer have`() = runTest {
+        // qualityKbps / sampleRateHz / bitsPerSample are read OFF THE FILE,
+        // not from the source catalog. A merged row lands not-downloaded, so
+        // keeping them lets a quality badge describe audio that isn't there
+        // until adoption re-stamps the row.
+        val uri = buildBackupZip { backup ->
+            backup.trackDao().insert(
+                track("Elsewhere", spotifyUri = "spotify:track:e").copy(
+                    isDownloaded = true,
+                    filePath = "/data/user/0/other.install/files/music/elsewhere.flac",
+                    fileSizeBytes = 40_000_000,
+                    qualityKbps = 1411,
+                    sampleRateHz = 96_000,
+                    bitsPerSample = 24,
+                )
+            )
+        }
+
+        val result = manager.importDatabase(uri, BackupImportScope.LIBRARY_MERGE)
+
+        assertTrue(result.isSuccess)
+        val merged = live.trackDao().getAllForIntegrityScan().single()
+        assertEquals(0, merged.qualityKbps)
+        assertNull(merged.sampleRateHz)
+        assertNull(merged.bitsPerSample)
+    }
+
+    @Test
+    fun `merged memberships keep the backup's locally-added flag`() = runTest {
+        // locally_added decides whether a REFRESH sync may clean a membership
+        // up (PlaylistDao.clearSyncedPlaylistTracks deletes locally_added = 0
+        // only). Forcing every merged row to 1 would pin a stale backup's
+        // tracks into a synced playlist forever, so the backup's own answer
+        // travels with the row.
+        val pid = live.playlistDao().insert(playlist("List", "list-1"))
+        val uri = buildBackupZip { backup ->
+            val synced = backup.trackDao().insert(track("Synced", spotifyUri = "spotify:track:s"))
+            val byHand = backup.trackDao().insert(track("ByHand", spotifyUri = "spotify:track:h"))
+            val bPid = backup.playlistDao().insert(playlist("List", "list-1"))
+            backup.playlistDao().insertCrossRef(
+                PlaylistTrackCrossRef(bPid, synced, position = 0, locallyAdded = false),
+            )
+            backup.playlistDao().insertCrossRef(
+                PlaylistTrackCrossRef(bPid, byHand, position = 1, locallyAdded = true),
+            )
+        }
+
+        val result = manager.importDatabase(uri, BackupImportScope.LIBRARY_MERGE)
+
+        assertTrue(result.isSuccess)
+        assertEquals(2, result.getOrThrow().mergedMemberships)
+        val titleById = live.trackDao().getAllForIntegrityScan().associate { it.id to it.title }
+        val flagByTitle = live.playlistDao().getCrossRefsForPlaylist(pid)
+            .associate { titleById.getValue(it.trackId) to it.locallyAdded }
+        assertFalse(flagByTitle.getValue("Synced"))
+        assertTrue(flagByTitle.getValue("ByHand"))
+    }
+
+    @Test
+    fun `a settings-only import of a backup that carries no settings fails`() = runTest {
+        // buildBackupZip writes manifest.json + stash.db and no datastore/
+        // entries at all. Reporting success here would tell the user their
+        // preferences were restored when nothing was written — the DB path
+        // already refuses the mirror case ("contains no database").
+        live.trackDao().insert(track("Keep me", spotifyUri = "spotify:track:k"))
+        val uri = buildBackupZip { backup -> backup.trackDao().insert(track("A")) }
+
+        val result = manager.importDatabase(uri, BackupImportScope.SETTINGS_REPLACE)
+
+        assertTrue(result.isFailure)
+        assertEquals(1, live.trackDao().getAllForIntegrityScan().size)
+    }
 }
