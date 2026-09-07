@@ -393,11 +393,14 @@ class DatabaseBackupManager @Inject constructor(
                 }
             }
 
-            // Mirror of the check above for the settings-only scope: a
-            // library-only export carries no `datastore/` entries, and
-            // committing zero files would report a successful settings
-            // restore that wrote nothing.
-            if (scope.restoresSettingsFiles && stagedDatastore.isEmpty()) {
+            // Mirror of the check above, SETTINGS_REPLACE only: a library-only
+            // export carries no `datastore/` entries, and committing zero files
+            // would report a successful settings restore that wrote nothing.
+            // Deliberately NOT scope.restoresSettingsFiles — that would also
+            // fail EVERYTHING_REPLACE on an archive whose database is fine but
+            // whose export predated any preference write (the exporter emits
+            // datastore entries only `if (datastoreDir.exists())`).
+            if (scope == BackupImportScope.SETTINGS_REPLACE && stagedDatastore.isEmpty()) {
                 cleanupStaging(stagedDb, stagedDatastore)
                 throw IllegalStateException("The selected backup contains no settings.")
             }
@@ -520,9 +523,12 @@ class DatabaseBackupManager @Inject constructor(
      *     unless that track is already an active member. Soft-deleted
      *     memberships are reactivated — the backup's content is being added,
      *     which is exactly the requested semantics. All imported memberships
-     *     keep the backup's own `locally_added` answer — forcing it to 1
-     *     would make every restored membership immune to the REFRESH
-     *     cleanup that exists to drop what a remote no longer has —
+     *     keep the backup's own `locally_added` answer when a sync actually
+     *     mirrors the playlist (`last_synced != null`) — forcing it to 1
+     *     cleanup that exists to drop what a remote no longer has. Where no
+     *     sync has ever run, a 0 is a state no live write path can produce,
+     *     so it is read as user-added instead; reactivation ORs with the
+     *     live row so provenance is never downgraded —
      *     and cached `track_count`s of touched playlists are recomputed.
      *
      * **Known limit.** A backup predating the canonical-identity columns
@@ -613,6 +619,7 @@ class DatabaseBackupManager @Inject constructor(
                             id = 0,
                             isDownloaded = false,
                             filePath = null,
+                            albumArtPath = null,
                             fileSizeBytes = 0,
                             qualityKbps = 0,
                             sampleRateHz = null,
@@ -632,8 +639,19 @@ class DatabaseBackupManager @Inject constructor(
 
                 // ── 2. Playlists ─────────────────────────────────────────
                 val liveBySourceId = HashMap<String, Long>()
+                // Live playlist ids a sync run has mirrored. DiffWorker is the
+                // ONLY writer of last_synced (PlaylistDao.updateLastSynced has
+                // one call site), so non-null means this playlist's membership
+                // can legitimately be sync-owned. Null means no sync has ever
+                // touched it, and there a locally_added = 0 row is a state
+                // nothing else in the schema produces — every live add path
+                // stamps 1. Absence resolves to "user-added", which is the
+                // safe direction: a wrongly-kept membership is one the user
+                // can delete by hand, a wrongly-dropped one is gone.
+                val syncMirrored = HashSet<Long>()
                 for (p in playlistDao.getAllForBackupMerge()) {
                     liveBySourceId.putIfAbsent(p.sourceId, p.id)
+                    if (p.lastSynced != null) syncMirrored += p.id
                 }
 
                 /** Backup playlist id → live playlist id. */
@@ -659,6 +677,7 @@ class DatabaseBackupManager @Inject constructor(
                         )
                     )
                     liveBySourceId.putIfAbsent(playlist.sourceId, newId)
+                    if (playlist.lastSynced != null) syncMirrored += newId
                     playlistIdMap[playlist.id] = newId
                     addedPlaylists++
                 }
@@ -679,6 +698,7 @@ class DatabaseBackupManager @Inject constructor(
                 val touchedPlaylists = sortedSetOf<Long>()
                 for ((backupPlaylistId, refs) in backupRefs.groupBy { it.playlistId }) {
                     val livePlaylistId = playlistIdMap[backupPlaylistId] ?: continue
+                    val syncOwnsMembership = livePlaylistId in syncMirrored
                     for (ref in refs.sortedBy { it.position }) {
                         // A membership the user REMOVED in the backup carries
                         // removedAt — restoring it would ADD a track the
@@ -701,13 +721,16 @@ class DatabaseBackupManager @Inject constructor(
                                 removedAt = null,
                                 position = position,
                                 addedAt = ref.addedAt,
-                                locallyAdded = ref.locallyAdded,
+                                // Reactivation overwrites a LIVE row: OR so the
+                                // user's own provenance is never downgraded.
+                                locallyAdded = existing.locallyAdded ||
+                                    ref.locallyAdded || !syncOwnsMembership,
                             ) ?: PlaylistTrackCrossRef(
                                 playlistId = livePlaylistId,
                                 trackId = liveTrackId,
                                 position = position,
                                 addedAt = ref.addedAt,
-                                locallyAdded = ref.locallyAdded,
+                                locallyAdded = ref.locallyAdded || !syncOwnsMembership,
                             )
                         )
                         mergedMemberships++

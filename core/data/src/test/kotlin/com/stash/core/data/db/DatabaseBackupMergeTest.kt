@@ -23,6 +23,7 @@ import org.robolectric.annotation.Config
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.time.Instant
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -74,11 +75,26 @@ class DatabaseBackupMergeTest {
         canonicalArtist = artist.lowercase(),
     )
 
-    private fun playlist(name: String, sourceId: String) = PlaylistEntity(
+    /**
+     * [lastSynced] is the discriminator the merge uses for membership
+     * ownership: DiffWorker is its only writer, so non-null means a sync
+     * run has mirrored this playlist and its `locally_added = 0` rows are
+     * genuinely sync-owned.
+     */
+    private fun playlist(name: String, sourceId: String, lastSynced: Instant? = null) = PlaylistEntity(
         name = name,
         source = MusicSource.SPOTIFY,
         sourceId = sourceId,
+        lastSynced = lastSynced,
     )
+
+    /** `locally_added` of the membership joining [playlistId] to [title]. */
+    private suspend fun flagFor(playlistId: Long, title: String): Boolean {
+        val trackId = live.trackDao().getAllForIntegrityScan().first { it.title == title }.id
+        return live.playlistDao().getCrossRefsForPlaylist(playlistId)
+            .first { it.trackId == trackId }
+            .locallyAdded
+    }
 
     private suspend fun addMember(playlistId: Long, trackId: Long, position: Int) {
         live.playlistDao().insertCrossRef(
@@ -356,6 +372,7 @@ class DatabaseBackupMergeTest {
                     qualityKbps = 1411,
                     sampleRateHz = 96_000,
                     bitsPerSample = 24,
+                    albumArtPath = "/data/user/0/other.install/files/art/elsewhere.jpg",
                 )
             )
         }
@@ -367,16 +384,17 @@ class DatabaseBackupMergeTest {
         assertEquals(0, merged.qualityKbps)
         assertNull(merged.sampleRateHz)
         assertNull(merged.bitsPerSample)
+        assertNull(merged.albumArtPath)
     }
 
     @Test
-    fun `merged memberships keep the backup's locally-added flag`() = runTest {
-        // locally_added decides whether a REFRESH sync may clean a membership
-        // up (PlaylistDao.clearSyncedPlaylistTracks deletes locally_added = 0
-        // only). Forcing every merged row to 1 would pin a stale backup's
-        // tracks into a synced playlist forever, so the backup's own answer
-        // travels with the row.
-        val pid = live.playlistDao().insert(playlist("List", "list-1"))
+    fun `a sync-owned membership stays sync-owned so REFRESH can still drop it`() = runTest {
+        // locally_added = 1 makes a membership immune to
+        // PlaylistDao.clearSyncedPlaylistTracks AND to
+        // SyncUndoDao.clearSyncedMembershipForRestore. Forcing it on every
+        // merged row pinned a stale backup's tracks into a synced playlist
+        // forever, so a sync-owned row keeps the backup's honest 0.
+        val pid = live.playlistDao().insert(playlist("List", "list-1", lastSynced = Instant.now()))
         val uri = buildBackupZip { backup ->
             val synced = backup.trackDao().insert(track("Synced", spotifyUri = "spotify:track:s"))
             val byHand = backup.trackDao().insert(track("ByHand", spotifyUri = "spotify:track:h"))
@@ -393,11 +411,60 @@ class DatabaseBackupMergeTest {
 
         assertTrue(result.isSuccess)
         assertEquals(2, result.getOrThrow().mergedMemberships)
-        val titleById = live.trackDao().getAllForIntegrityScan().associate { it.id to it.title }
-        val flagByTitle = live.playlistDao().getCrossRefsForPlaylist(pid)
-            .associate { titleById.getValue(it.trackId) to it.locallyAdded }
-        assertFalse(flagByTitle.getValue("Synced"))
-        assertTrue(flagByTitle.getValue("ByHand"))
+        assertFalse(flagFor(pid, "Synced"))
+        assertTrue(flagFor(pid, "ByHand"))
+    }
+
+    @Test
+    fun `a playlist no sync has mirrored takes every membership as user-added`() = runTest {
+        // No sync writes memberships into a playlist it does not mirror, so
+        // every live add path stamps locally_added = 1 there and a 0 is a
+        // state nothing else in the schema can produce. A backup predating
+        // the column (MIGRATION_22_23 added it DEFAULT 0) reads 0 even for
+        // rows the user added by hand, and importing that verbatim would
+        // expose them to SyncUndoDao.clearSyncedMembershipForRestore, whose
+        // DELETE is playlist-type-blind. last_synced is the discriminator:
+        // DiffWorker is its only writer, so null means no sync has ever
+        // touched this playlist.
+        val pid = live.playlistDao().insert(playlist("Mine", "custom_abc", lastSynced = null))
+        val uri = buildBackupZip { backup ->
+            val t = backup.trackDao().insert(track("Mine", spotifyUri = "spotify:track:m"))
+            val bPid = backup.playlistDao().insert(playlist("Mine", "custom_abc"))
+            backup.playlistDao().insertCrossRef(
+                PlaylistTrackCrossRef(bPid, t, position = 0, locallyAdded = false),
+            )
+        }
+
+        val result = manager.importDatabase(uri, BackupImportScope.LIBRARY_MERGE)
+
+        assertTrue(result.isSuccess)
+        assertTrue(flagFor(pid, "Mine"))
+    }
+
+    @Test
+    fun `reactivating a membership never downgrades the live row's provenance`() = runTest {
+        // The live row is the user's own hand-add, soft-deleted. The backup
+        // holds the same membership as sync-added. Reactivation must not let
+        // the backup's 0 overwrite the live 1 — that would hand a row the
+        // user created to the next REFRESH or sync-undo.
+        val pid = live.playlistDao().insert(playlist("List", "list-1", lastSynced = Instant.now()))
+        val tid = live.trackDao().insert(track("Song", spotifyUri = "spotify:track:x"))
+        live.playlistDao().insertCrossRef(
+            PlaylistTrackCrossRef(pid, tid, position = 0, locallyAdded = true),
+        )
+        live.playlistDao().softDeleteTrackFromPlaylist(pid, tid)
+        val uri = buildBackupZip { backup ->
+            val bt = backup.trackDao().insert(track("Song", spotifyUri = "spotify:track:x"))
+            val bPid = backup.playlistDao().insert(playlist("List", "list-1"))
+            backup.playlistDao().insertCrossRef(
+                PlaylistTrackCrossRef(bPid, bt, position = 0, locallyAdded = false),
+            )
+        }
+
+        val result = manager.importDatabase(uri, BackupImportScope.LIBRARY_MERGE)
+
+        assertTrue(result.isSuccess)
+        assertTrue(flagFor(pid, "Song"))
     }
 
     @Test
