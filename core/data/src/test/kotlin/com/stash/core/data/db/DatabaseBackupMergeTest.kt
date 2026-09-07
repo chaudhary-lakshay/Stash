@@ -358,8 +358,9 @@ class DatabaseBackupMergeTest {
     }
 
     @Test
-    fun `merged tracks do not keep quality read off a file they no longer have`() = runTest {
-        // qualityKbps / sampleRateHz / bitsPerSample are read OFF THE FILE,
+    fun `merged tracks keep no state describing a file they no longer have`() = runTest {
+        // These columns all describe the audio FILE, not the catalog entry:
+        // qualityKbps / sampleRateHz / bitsPerSample are read off it,
         // not from the source catalog. A merged row lands not-downloaded, so
         // keeping them lets a quality badge describe audio that isn't there
         // until adoption re-stamps the row.
@@ -373,6 +374,7 @@ class DatabaseBackupMergeTest {
                     sampleRateHz = 96_000,
                     bitsPerSample = 24,
                     albumArtPath = "/data/user/0/other.install/files/art/elsewhere.jpg",
+                    metadataEmbeddedAt = 1_700_000_000_000L,
                 )
             )
         }
@@ -385,6 +387,11 @@ class DatabaseBackupMergeTest {
         assertNull(merged.sampleRateHz)
         assertNull(merged.bitsPerSample)
         assertNull(merged.albumArtPath)
+        // Not just untidy: getTracksNeedingEmbed and the Home banner count
+        // both gate on `metadata_embedded_at IS NULL`, so a stamp carried in
+        // from the backup means the file adoption creates later NEVER gets
+        // the v0.9.35 tag set — and there is no stale-stamp sweep to heal it.
+        assertNull(merged.metadataEmbeddedAt)
     }
 
     @Test

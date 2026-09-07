@@ -621,6 +621,12 @@ class DatabaseBackupManager @Inject constructor(
                             isDownloaded = false,
                             filePath = null,
                             albumArtPath = null,
+                            // getTracksNeedingEmbed and the Home banner count
+                            // both gate on `metadata_embedded_at IS NULL`, so a
+                            // stamp carried in from the backup would exclude the
+                            // file adoption creates later from the tag pass for
+                            // good — no stale-stamp sweep heals this one.
+                            metadataEmbeddedAt = null,
                             fileSizeBytes = 0,
                             qualityKbps = 0,
                             sampleRateHz = null,
